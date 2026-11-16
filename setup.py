@@ -90,6 +90,8 @@ CUDA_KERNEL_SOURCES = [
       for norm in ("norm", "nonorm")],
     # fp8 sparse prefill (h_q = 64): kv in e4m3, without q norm
     "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_prefill_nonorm_fp8.cu",
+    # fp8 decode (h_q = 64, fp4 extra cache): e4m3 Q with q_head_scale, KV dequantized to e4m3, without q norm
+    "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_nonorm_fp8.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
 ]

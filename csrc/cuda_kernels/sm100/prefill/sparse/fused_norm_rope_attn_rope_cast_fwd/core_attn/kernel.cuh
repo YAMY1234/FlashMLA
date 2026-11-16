@@ -60,6 +60,40 @@ float get_s_fp8_from_p(
     return cur_sum.x + cur_sum.y;
 }
 
+// 2x2 bf16 -> 4 e4m3 (RN, satfinite), in the order a.x, a.y, b.x, b.y. cvt...e4m3x2.bf16x2 keeps the element order of
+// its packed source (the fp8 prefill's Q cast relies on the same)
+__device__ __forceinline__
+uint32_t bf16x2x2_to_e4m3x4(ku::nvbf16x2 a, ku::nvbf16x2 b) {
+    uint32_t out;
+    asm("{\n"
+        ".reg .b16 lo, hi;\n"
+        "cvt.rn.satfinite.e4m3x2.bf16x2 lo, %1;\n"
+        "cvt.rn.satfinite.e4m3x2.bf16x2 hi, %2;\n"
+        "mov.b32 %0, {lo, hi};\n"
+        "}\n"
+        : "=r"(out) : "r"(*(const uint32_t*)&a), "r"(*(const uint32_t*)&b));
+    return out;
+}
+
+// 4 e4m3 x an ue8m0 scale -> 4 e4m3: the bf16 of the product is exact, then one RN (satfinite) rounding to e4m3
+__device__ __forceinline__
+uint32_t fp8x4_to_e4m3x4_with_scale(uint32_t in, __nv_fp8_e8m0 scale_e8m0) {
+    const uint16_t packed_scale = (uint16_t)(*(uint8_t*)&scale_e8m0) * 0x0101;
+    uint32_t out;
+    asm("{\n"
+        ".reg .b16 i0, i1, lo, hi;\n"
+        ".reg .b32 t0, t1;\n"
+        "mov.b32 {i0, i1}, %1;\n"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 t0, i0, %2;\n"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 t1, i1, %2;\n"
+        "cvt.rn.satfinite.e4m3x2.bf16x2 lo, t0;\n"
+        "cvt.rn.satfinite.e4m3x2.bf16x2 hi, t1;\n"
+        "mov.b32 %0, {lo, hi};\n"
+        "}\n"
+        : "=r"(out) : "r"(in), "h"(packed_scale));
+    return out;
+}
+
 // To achieve prefill - decoding alignment while using block_size = 96, decoding must reproduce
 // prefill's "natural" blocking of the concatenated indices array ([topk orig slots; extra_topk
 // extra slots], tiled by B_TOPK). Since topk (e.g. 128) may not be a multiple of B_TOPK (e.g. 96),
@@ -146,41 +180,54 @@ struct DequantRows {
     uint32_t local_warp_idx, row_in_wavefront, idx_in_row, chunk_rotation;
     uint32_t sts_offsets[NUM_STS_OFFSETS];
     uint32_t orig_scale_offset, extra_scale_offset, scale_token_stride;
+    // FP8_DECODE (e4m3 slot, 128-element swizzle-atom rows, h64): the lane's row offset in atom column 0, the row's
+    // swizzle, and the base offsets of its chunks: an fp8 lane's 8 chunks are atom column idx_in_row (parts 0..7, written
+    // in this order by every lane, see body), an fp4 lane's 4 chunks are parts 0..7 of one atom column
+    uint32_t e4m3_fp8_base, e4m3_fp4_base, e4m3_swz;
 
     __device__ __forceinline__ DequantRows(typename K::SharedMemoryPlan &smem_, uint32_t dq_warp_idx, uint32_t lane_idx, uint32_t cta_idx)
         : smem(smem_), local_warp_idx(dq_warp_idx),
           row_in_wavefront(lane_idx % NUM_ROWS_PER_WAVEFRONT), idx_in_row(lane_idx / NUM_ROWS_PER_WAVEFRONT),
           chunk_rotation(lane_idx % NUM_ROWS_PER_WAVEFRONT / 4 * 4) {
         using namespace cute;
-        Tensor sKV = make_tensor(make_smem_ptr(smem.kv_slots[0]), ku::make_umma_canonical_k_major_layout<B_TOPK, K::D_QK / K::CLUSTER_SIZE, 128>());
-        const uint32_t row = get_row_idx(0);
-        if constexpr (K::IS_2CTA) {
-            // Resolve the asymmetric scale transport once, outside the block loop, so both CTAs
-            // execute the same dequantization body without duplicating its instruction cache footprint.
-            auto init_scale_offset = [&]<typename F>() {
-                if (cta_idx == 0) {
-                    return K::SCALE_STAGE_OFFSET + row * K::SCALE_STAGE_ROW_BYTES;
-                }
-                using Cta1Format = typename K::template KVFormatCta<F::Base::MODEL_TYPE, 1>;
-                return row / 4 * K::RAW_KV_GROUP_BYTES + row % 4 * F::RAW_TOKEN_SMEM_STRIDE + Cta1Format::SCALE_OFFSET;
+        if constexpr (K::FP8_DECODE) {
+            static_assert(!K::IS_2CTA && OrigFormat::NUM_QUANT_CHUNKS_PER_LANE == 8 && ExtraFormat::NUM_QUANT_CHUNKS_PER_LANE == 4);
+            const uint32_t row = get_row_idx(0);
+            e4m3_swz = row % 8;
+            // Atom column c starts at c * B_TOPK * 128 B; row r of it at r * 128 B
+            e4m3_fp8_base = row * 128 + idx_in_row * STS_ATOM_COL_STRIDE_BYTES;
+            e4m3_fp4_base = row * 128 + get_chunk_base<ExtraFormat>(0) / 4 * STS_ATOM_COL_STRIDE_BYTES;
+        } else {
+            Tensor sKV = make_tensor(make_smem_ptr(smem.kv_slots[0]), ku::make_umma_canonical_k_major_layout<B_TOPK, K::D_QK / K::CLUSTER_SIZE, 128>());
+            const uint32_t row = get_row_idx(0);
+            if constexpr (K::IS_2CTA) {
+                // Resolve the asymmetric scale transport once, outside the block loop, so both CTAs
+                // execute the same dequantization body without duplicating its instruction cache footprint.
+                auto init_scale_offset = [&]<typename F>() {
+                    if (cta_idx == 0) {
+                        return K::SCALE_STAGE_OFFSET + row * K::SCALE_STAGE_ROW_BYTES;
+                    }
+                    using Cta1Format = typename K::template KVFormatCta<F::Base::MODEL_TYPE, 1>;
+                    return row / 4 * K::RAW_KV_GROUP_BYTES + row % 4 * F::RAW_TOKEN_SMEM_STRIDE + Cta1Format::SCALE_OFFSET;
+                };
+                orig_scale_offset = init_scale_offset.template operator()<OrigFormat>();
+                extra_scale_offset = init_scale_offset.template operator()<ExtraFormat>();
+                scale_token_stride = NUM_ROWS_PER_WAVEFRONT * (cta_idx == 0 ? K::SCALE_STAGE_ROW_BYTES : K::RAW_KV_GROUP_BYTES / 4);
+            }
+            // In the SW128 K-major layout a row is 128 B of every swizzle-atom column, and its 16 B part p lies at part index
+            // p ^ (row % 8). The layout gives the row's first part; the other entries are derived from it with 32-bit
+            // arithmetic. Deriving every entry from the layout takes 64-bit arithmetic per entry, and with all entries live at
+            // once ptxas spills the table
+            const uint32_t row_swizzle = row % 8;
+            const uint32_t row_start = (uint32_t)((&sKV(row, 0) - smem.kv_slots[0]) * sizeof(bf16)) - row_swizzle * 16;
+            // Offset of the (part_idx % 8)-th part of atom column part_idx / 8 of the row
+            auto part_offset = [&](uint32_t part_idx) {
+                return row_start + ((part_idx % 8 ^ row_swizzle) * 16) + part_idx / 8 * STS_ATOM_COL_STRIDE_BYTES;
             };
-            orig_scale_offset = init_scale_offset.template operator()<OrigFormat>();
-            extra_scale_offset = init_scale_offset.template operator()<ExtraFormat>();
-            scale_token_stride = NUM_ROWS_PER_WAVEFRONT * (cta_idx == 0 ? K::SCALE_STAGE_ROW_BYTES : K::RAW_KV_GROUP_BYTES / 4);
-        }
-        // In the SW128 K-major layout a row is 128 B of every swizzle-atom column, and its 16 B part p lies at part index
-        // p ^ (row % 8). The layout gives the row's first part; the other entries are derived from it with 32-bit
-        // arithmetic. Deriving every entry from the layout takes 64-bit arithmetic per entry, and with all entries live at
-        // once ptxas spills the table
-        const uint32_t row_swizzle = row % 8;
-        const uint32_t row_start = (uint32_t)((&sKV(row, 0) - smem.kv_slots[0]) * sizeof(bf16)) - row_swizzle * 16;
-        // Offset of the (part_idx % 8)-th part of atom column part_idx / 8 of the row
-        auto part_offset = [&](uint32_t part_idx) {
-            return row_start + ((part_idx % 8 ^ row_swizzle) * 16) + part_idx / 8 * STS_ATOM_COL_STRIDE_BYTES;
-        };
-        CUTE_UNROLL
-        for (uint32_t p = 0; p < 8; ++p) {
-            sts_offsets[p] = part_offset(p);
+            CUTE_UNROLL
+            for (uint32_t p = 0; p < 8; ++p) {
+                sts_offsets[p] = part_offset(p);
+            }
         }
     }
 
@@ -250,10 +297,11 @@ struct DequantRows {
                 }
             } else {
                 if constexpr (F::NUM_QUANT_CHUNKS_PER_LANE == 8) {
-                    // A rotated lane swaps the two halves of its chunks, so also the two halves of its scale bytes
+                    // A rotated lane swaps the two halves of its chunks, so also the two halves of its scale bytes.
+                    // FP8_DECODE converts the chunks in the row's order (see below), so its scales stay in that order
                     if constexpr (SCALE_BYTES_PER_LANE == 4) {
                         uint32_t scales = *(uint32_t*)(scale_src + idx_in_row * 4);
-                        cached_scales[token_idx][0] = chunk_rotation ? __byte_perm(scales, scales, 0x1032) : scales;
+                        cached_scales[token_idx][0] = (chunk_rotation && !K::FP8_DECODE) ? __byte_perm(scales, scales, 0x1032) : scales;
                     } else {
                         static_assert(SCALE_BYTES_PER_LANE == 2);
                         uint32_t scales = *(uint16_t*)(scale_src + idx_in_row * 2);
@@ -281,6 +329,9 @@ struct DequantRows {
         });
         NamedBarrier::arrive_and_wait(128, K::barrier_ids::WG1_DEQUANT_SYNC);  // Make sure everyone has finished reading
 
+        if constexpr (K::FP8_DECODE) {
+            write_e4m3(slot_base, for_each_token, cached_scales, cached_input);
+        } else
         for_each_token([&]<typename F>(uint32_t token_idx) {
             static constexpr uint32_t NUM_STS_PER_CHUNK = num_sts_per_chunk<F>();
             uint8_t *token_base = slot_base + token_idx * STS_TOKEN_STRIDE_BYTES;
@@ -326,6 +377,58 @@ struct DequantRows {
 
         cutlass::arch::fence_view_async_shared();
         K::arrive_on_cta0_barrier(smem.bar_kv_slot_full[kv_slot_idx]);
+    }
+
+    // FP8_DECODE: write this thread's rows as e4m3, each element rounded once from its exact dequantized value (fp8: the
+    // bf16 of e4m3 x ue8m0, fp4: the bf16 of e2m1 x e4m3, both exact). An fp8 chunk (16 elements) is one 16 B part of the
+    // e4m3 atom row, an fp4 chunk (32 elements) two. Every lane writes its fp8 chunks in the order of the row: a rotated
+    // lane (rows 4..7 of a wavefront) read them with its two halves swapped, and writing in that order would put rows r and
+    // r + 4 on the same bank group, since here a rotation by 4 fp8 chunks is a rotation by 4 parts, not by a whole atom
+    // row. Its fp4 chunks are rotated by 8 parts, one atom row, which keeps the bank groups apart
+    template<typename ForEachToken, typename Scales, typename Inputs>
+    __device__ __forceinline__ void write_e4m3(uint8_t *slot_base, ForEachToken &for_each_token, const Scales &cached_scales, const Inputs &cached_input) const {
+        for_each_token([&]<typename F>(uint32_t token_idx) {
+            uint8_t *token_base = slot_base + token_idx * STS_TOKEN_STRIDE_BYTES;
+            if constexpr (F::IS_FP4) {
+                static_assert(F::QUANT_TILE_SIZE == 16 && F::CHUNK_ELEMS == 32);
+                ku::nvbf16x2 fp4_scales[2];   // the two scales of each of the current pair of chunks, as bf16
+                CUTE_UNROLL
+                for (uint32_t g = 0; g < F::NUM_QUANT_CHUNKS_PER_LANE; ++g) {
+                    if (g % 2 == 0) {
+                        fp8x4_to_bf16x2x2(cached_scales[token_idx][g / 2], fp4_scales);
+                    }
+                    CUTE_UNROLL
+                    for (uint32_t j = 0; j < 2; ++j) {   // part j: elements [16j, 16j + 16) of the chunk, one scale
+                        const ku::nvbf16x2 sc = j == 0 ? __low2bfloat162(fp4_scales[g % 2]) : __high2bfloat162(fp4_scales[g % 2]);
+                        uint32_t out[4];
+                        CUTE_UNROLL
+                        for (uint32_t k = 0; k < 2; ++k) {
+                            ku::nvbf16x2 quad[4];
+                            fp4x8_to_bf16x2x4(cached_input[token_idx][g][j * 2 + k], quad);
+                            CUTE_UNROLL
+                            for (uint32_t q = 0; q < 4; ++q) quad[q] = __hmul2(quad[q], sc);
+                            out[k * 2] = bf16x2x2_to_e4m3x4(quad[0], quad[1]);
+                            out[k * 2 + 1] = bf16x2x2_to_e4m3x4(quad[2], quad[3]);
+                        }
+                        *(uint4*)(token_base + e4m3_fp4_base + (((2 * g + j) ^ e4m3_swz) << 4)) = *(const uint4*)out;
+                    }
+                }
+            } else {
+                static_assert(F::QUANT_TILE_SIZE == 32 && F::CHUNK_ELEMS == 16);
+                const __nv_fp8_e8m0 *scales = (const __nv_fp8_e8m0*)cached_scales[token_idx];   // in the row's order
+                CUTE_UNROLL
+                for (uint32_t g = 0; g < F::NUM_QUANT_CHUNKS_PER_LANE; ++g) {
+                    uint32_t out[4];
+                    CUTE_UNROLL
+                    for (uint32_t w = 0; w < 4; ++w) {
+                        // Chunk g of the row is entry g ^ 4 of a rotated lane (get_chunk_base)
+                        const uint32_t in = chunk_rotation ? cached_input[token_idx][g ^ 4][w] : cached_input[token_idx][g][w];
+                        out[w] = fp8x4_to_e4m3x4_with_scale(in, scales[g / 2]);
+                    }
+                    *(uint4*)(token_base + e4m3_fp8_base + ((g ^ e4m3_swz) << 4)) = *(const uint4*)out;
+                }
+            }
+        });
     }
 
     // Dispatch on this thread's number of fp8 tokens (warp-uniform since topk % 8 == 0) so a token's
@@ -802,7 +905,75 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup] = q_sqr_sum;
                 smem.bar_q_sqr_sum_full.arrive();
             }
-        }; 
+        };
+        // FP8_DECODE: Q arrives as e4m3 (Q / q_head_scale, in the permuted layout: 16-element chunks interleaved across
+        // heads, chunk c of head h at byte (c * H_Q + h) * 16). Single-rail QK wants the whole head in both lane groups
+        // (config.h), so each thread loads all 512 B of its head (the thread of the other lane group loads the same
+        // bytes), rotates the RoPE dims in fp32 and rounds them back to e4m3 at the same scale, and stores the head in
+        // dim order to TMEM. The loads are issued in 4 tiles of 8 chunks (16 KB per CTA each), each tile's addresses
+        // depending on the previous tile's data, for the reason given at GROUP_Q_LOADS
+        auto load_q8_and_save_to_tmem = [&](const OuterloopArgs &cur_job) {
+            static constexpr uint32_t NUM_CHUNKS = D_QK / 16;
+            static constexpr uint32_t CHUNKS_PER_TILE = 8;
+            static constexpr uint32_t FIRST_ROPE_CHUNK = D_NOPE / 16;
+            uint32_t cur_q_position = __ldg(params.token_positions + cur_job.s_q_idx);
+            cached_cos[1] = __ldg(params.cos_sin_cache + cur_q_position * D_ROPE + lane_idx);
+            cached_sin[1] = __ldg(params.cos_sin_cache + cur_q_position * D_ROPE + D_ROPE / 2 + lane_idx);
+            const uint8_t *q_head_base = (const uint8_t*)params.q + (uint64_t)cur_job.s_q_idx * params.stride_q_s_q
+                                       + (idx_in_warpgroup % H_Q_PER_CTA) * 16;
+            uint32_t q_words[NUM_CHUNKS * 4];
+            uint32_t q_load_dep = 0;
+            const uint32_t q_zero = cur_job.topk_length >> 31;   // 0 at run time, see load_q_and_save_to_tmem
+            CUTE_UNROLL
+            for (uint32_t tile = 0; tile < NUM_CHUNKS / CHUNKS_PER_TILE; ++tile) {
+                CUTE_UNROLL
+                for (uint32_t i = 0; i < CHUNKS_PER_TILE; ++i) {
+                    const uint32_t c = tile * CHUNKS_PER_TILE + i;
+                    uint4 v;
+                    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                                 : "l"(q_head_base + c * H_Q * 16 + q_load_dep));
+                    *(uint4*)(q_words + c * 4) = v;
+                }
+                uint32_t tile_words = 0;
+                CUTE_UNROLL
+                for (uint32_t i = 0; i < CHUNKS_PER_TILE; ++i) {
+                    tile_words ^= q_words[(tile * CHUNKS_PER_TILE + i) * 4];
+                }
+                q_load_dep = tile_words & q_zero;
+            }
+            // RoPE: dims D_NOPE + 2j, D_NOPE + 2j + 1 are pair j, whose cos / sin lane j holds
+            CUTE_UNROLL
+            for (uint32_t w = FIRST_ROPE_CHUNK * 4; w < NUM_CHUNKS * 4; ++w) {
+                const uint32_t pair = (w - FIRST_ROPE_CHUNK * 4) * 2;
+                float2 x0, x1;
+                {
+                    const ku::nvbf16x2 lo = fp8x2_to_bf16x2(*(const ku::nve4m3x2*)&((const uint16_t*)&q_words[w])[0]);
+                    const ku::nvbf16x2 hi = fp8x2_to_bf16x2(*(const ku::nve4m3x2*)&((const uint16_t*)&q_words[w])[1]);
+                    x0 = __bfloat1622float2(lo);
+                    x1 = __bfloat1622float2(hi);
+                }
+                const float2 y0 = apply_rope(x0, __shfl_sync(0xFFFFFFFF, cached_cos[1], pair), __shfl_sync(0xFFFFFFFF, cached_sin[1], pair));
+                const float2 y1 = apply_rope(x1, __shfl_sync(0xFFFFFFFF, cached_cos[1], pair + 1), __shfl_sync(0xFFFFFFFF, cached_sin[1], pair + 1));
+                asm("{\n"
+                    ".reg .b16 lo, hi;\n"
+                    "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+                    "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+                    "mov.b32 %0, {lo, hi};\n}"
+                    : "=r"(q_words[w]) : "f"(y0.x), "f"(y0.y), "f"(y1.x), "f"(y1.y));
+            }
+
+            smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2^1);
+            ku::tcgen05_after_thread_sync();
+            static constexpr uint32_t COLS_PER_STORE = 32;   // 128 dims
+            CUTE_UNROLL
+            for (uint32_t s = 0; s < NUM_CHUNKS * 4 / COLS_PER_STORE; ++s) {
+                ku::tmem_st_32dp32bNx<COLS_PER_STORE>(tmem_cols::Q + s * COLS_PER_STORE, q_words + s * COLS_PER_STORE);
+            }
+            cutlass::arch::fence_view_async_tmem_store();
+            ku::tcgen05_before_thread_sync();
+            arrive_on_cta0_barrier(smem.bar_tQ_full);
+        };
         auto store_o = [&](const OuterloopArgs &cur_job, const bool &is_last_job) { 
             smem.bar_li_mi_full.wait(cur_job.job_idx_mod_2);
             float mi = smem.rowwise_mi_buf[idx_in_warpgroup % H_Q_PER_CTA];
@@ -1068,7 +1239,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             CUTE_NO_UNROLL
             for (bool first = true; ; first = false) {
                 if (q_job.is_valid) {
-                    load_q_and_save_to_tmem.template operator()<QSource::Global>(q_job);
+                    if constexpr (FP8_DECODE) {
+                        load_q8_and_save_to_tmem(q_job);
+                    } else {
+                        load_q_and_save_to_tmem.template operator()<QSource::Global>(q_job);
+                    }
                 }
                 if (!first) {
                     store_o(cur_job, !q_job.is_valid);
@@ -1110,6 +1285,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         static_assert(FOLD_FACTOR == 2);
         const uint32_t token_slice = local_warp_idx >= 2 ? 1u : 0u;
         KVElem *sS_base = smem.s + token_slice * (H_Q_PER_CTA * (B_TOPK / FOLD_FACTOR)) + (idx_in_warpgroup % H_Q_PER_CTA) * S_CHUNK_ELEMS;
+        // FP8_DECODE: the head's Q scale folds into the softmax scale
+        const float q_head_scale = FP8_DECODE ? __ldg(params.q_head_scale + cta_idx * H_Q_PER_CTA + idx_in_warpgroup % H_Q_PER_CTA) : 1.0f;
         RingBufferState rs;
         do {
             // For definition and consistency about `mi`, `li`, and `real_mi`, plz refer to head64 prefill
@@ -1128,7 +1305,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 score_multiplier = smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup] + smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^64];
                 score_multiplier = params.sm_scale_div_log2 * rsqrtf(score_multiplier / D_QK + params.rms_norm_eps);    // rsqrt is translated to `MUFU.RSQ`
             } else {
-                score_multiplier = params.sm_scale_div_log2;
+                score_multiplier = FP8_DECODE ? params.sm_scale_div_log2 * q_head_scale : params.sm_scale_div_log2;
             }
 
             smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2 ^ 1);
@@ -1898,6 +2075,7 @@ void Kernel<CONFIG>::run(const Params &params) {
     if constexpr (IS_DECODE) {
         KU_ASSERT(params.b == 1, "Only batch size 1 is supported for the fused decoding kernel");
         KU_ASSERT(params.model_type == MODEL_TYPE && params.extra_model_type == EXTRA_MODEL_TYPE);
+        KU_ASSERT(FP8_DECODE == (params.q_head_scale != nullptr), "e4m3 Q and q_head_scale go together (the fp8 decode)");
         if (params.extra_topk > 0) {
             // A KV block may straddle the orig/extra boundary (see KVLocation::ORIG_AND_EXTRA). Since
             // one TMA gather4 covers 4 consecutive rows sharing one tensor map, the boundary (i.e.
@@ -2045,7 +2223,26 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
             return;
         }
     }
-    if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Decode && CONFIG.H_Q == 64) {
+    if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Decode && CONFIG.QKV_FP8) {
+        // fp8 decode: its 4 KV slots of e4m3 fit the regular shared memory, so it needs no oversized variant. Above one
+        // wave the indices warp prefetches the next job's first block; up to one wave the O epilogue is pipelined
+        constexpr Config ONE_WAVE_CONFIG = [] {
+            Config config = CONFIG;
+            config.PIPELINED_EPILOGUE = true;
+            return config;
+        }();
+        constexpr Config JOB_PREFETCH_CONFIG = [] {
+            Config config = CONFIG;
+            config.JOB_PREFETCH = true;
+            return config;
+        }();
+        if (params.s_q <= params.num_sm) {
+            Kernel<ONE_WAVE_CONFIG>::run(params);
+        } else {
+            Kernel<JOB_PREFETCH_CONFIG>::run(params);
+        }
+        return;
+    } else if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Decode && CONFIG.H_Q == 64) {
         constexpr Config OVERSIZED_CONFIG = [] {
             Config config = CONFIG;
             config.OVERSIZED_SMEM = true;

@@ -134,6 +134,7 @@ def decode(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     use_legacy: bool = False,
+    q_head_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
@@ -159,7 +160,7 @@ def decode(
         use_packed_ue8m0: must be True
 
     Args (Core Attn):
-        q: [s_q, h_q, d_qk], bfloat16
+        q: [s_q, h_q, d_qk], bfloat16, or float8_e4m3fn with `q_head_scale` (the fp8 decode, see below)
             Already permuted by permute_q_b_proj
         k_cache: [num_blocks, page_block_size, h_kv, bytes_per_token], fp8_e4m3 (or int8/uint8). h_kv must be 1. Paged quantized KV cache. The format is
             detected from bytes_per_token: 528 (V4.1 fp8) or 288 (V4.1 with fp4 e2m1 + per-16 e4m3 scales; only valid for `extra_k_cache`).
@@ -175,6 +176,13 @@ def decode(
         use_legacy: bool. Route to the frozen pre-2026.09.30 kernels, which read the V4 and the
             pre-release block-split V4.1 KV cache formats instead of the interleaved ones. The
             two sides take the same arguments; `k_cache` decides the format by its bytes per token.
+        q_head_scale: optional, [h_q], float32. Given exactly when q is float8_e4m3fn: q holds Q / q_head_scale per head
+            (e.g. power-of-two scales folded into the q_b_proj weight scales). Selects the fp8 decode (h_q == 64,
+            enable_q_norm=False, an fp4 extra_k_cache, use_legacy=False): Q.K and S.V run on e4m3 tensor cores; every
+            gathered KV row is rounded to e4m3 once from its exact dequantized value (values above 448 saturate,
+            values below 2^-6 are e4m3 subnormals); the RoPE dims of Q are rotated in fp32 and rounded back to e4m3 at
+            the head's scale; S is scaled by 4 before its e4m3 cast as in the fp8 prefill. out_fp8, out_sf and lse
+            keep their meaning
 
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
@@ -182,12 +190,15 @@ def decode(
         - lse: [s_q, h_q], float
     """
     ops = get_ops(use_legacy)
+    if q_head_scale is not None and use_legacy:
+        raise ValueError("q_head_scale (the fp8 decode) is not supported by the legacy kernels")
     out_fp8, out_sf, lse = ops.fused_norm_rope_attn_rope_cast_decode(
         q, k_cache, indices_in_kvcache, sm_scale, d_v,
         attn_sink, topk_length,
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0,
+        *((q_head_scale,) if q_head_scale is not None else ())
     )
     return out_fp8, out_sf, lse
 

@@ -19,7 +19,10 @@ struct Config {
     bool STAGE_Q = true;
     bool PIPELINED_EPILOGUE = false;   // Decode h64, at most one wave: one tile of TMEM-load lookahead in the O epilogue
     bool JOB_PREFETCH = false;         // Decode, above one wave: prefetch the next job's block 0 indices
-    bool QKV_FP8 = false;              // Prefill h64: `kv` is e4m3, and Q, K, V and P enter the UMMAs as e4m3
+    bool QKV_FP8 = false;              // Prefill h64: `kv` is e4m3, and Q, K, V and P enter the UMMAs as e4m3. Decode h64 with
+                                       // an fp4 extra cache: e4m3 Q with q_head_scale, KV dequantized to e4m3 (FP8_DECODE)
+    uint32_t FP8_DECODE_KV_SLOTS = 4;  // FP8_DECODE: the number of KV slots
+    uint32_t FP8_DECODE_RAW_BARS = 2;  // FP8_DECODE: raw-gather batches in flight (see NUM_RAW_BARS)
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel
@@ -49,6 +52,9 @@ struct ParamsTemplate : Base {
     uint32_t stride_out_sf_wv_group, stride_out_sf_head_dim;
     // out_sf in the 128x4-swizzled scale layout per wv group: row r at word (r/128)*128*words_per_row + (r%32)*4 + (r/32)%4, 4-column stride 128
     bool out_sf_swizzled_128x4 = false;
+
+    // FP8_DECODE: `q` holds e4m3 (stride_q_s_q counts e4m3 elements) and head h's values are Q / q_head_scale[h]
+    float* __restrict__ q_head_scale = nullptr;  // [h_q]
 };
 
 template<SparseAttnFwdMode FWD_MODE>

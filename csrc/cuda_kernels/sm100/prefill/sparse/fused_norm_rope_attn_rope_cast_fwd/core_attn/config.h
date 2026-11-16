@@ -127,7 +127,14 @@ static constexpr bool QKV_FP8 = CONFIG.QKV_FP8;
 // 4 * S <= 256 stays below 448. li sums the scaled values, so O / li is unchanged; the row's max is published as
 // m - P_LOG2_SCALE to the epilogue, which uses it only for lse and the sink term
 static constexpr float P_LOG2_SCALE = QKV_FP8 ? 2.0f : 0.0f;
-static_assert(!QKV_FP8 || (FWD_MODE == SparseAttnFwdMode::Prefill && H_Q == 64 && !OVERSIZED_SMEM && !ENABLE_Q_NORM));
+// fp8 decode (QKV_FP8 with FWD_MODE == Decode, h_q = 64, an fp4 extra cache): the same QK / softmax / SV as the fp8
+// prefill, with two differences. Q is read as e4m3 with a per-head scale (`q_head_scale`, folded into the softmax
+// scale), so the kernel only re-rounds its RoPE dims. The decode dequant writes e4m3 instead of bf16: every gathered row
+// is rounded to e4m3 once (fp8 rows: e4m3 x ue8m0 scale; fp4 rows: e2m1 x e4m3 scale), in place in the KV slot
+static constexpr bool FP8_DECODE = QKV_FP8 && FWD_MODE == SparseAttnFwdMode::Decode;
+static_assert(!QKV_FP8 || (H_Q == 64 && !ENABLE_Q_NORM));
+static_assert(!QKV_FP8 || FP8_DECODE || (FWD_MODE == SparseAttnFwdMode::Prefill && !OVERSIZED_SMEM));
+static_assert(!FP8_DECODE || (CONFIG.EXTRA_MODEL_TYPE == ModelType::V41_FP4 && !CONFIG.STAGE_Q));
 using KVElem = std::conditional_t<QKV_FP8, fp8_e4m3, bf16>;   // The element of the KV slots and of S (UMMA operands)
 static constexpr uint32_t KV_CHUNK_ELEMS = 128 / sizeof(KVElem);       // Elements per 128 B swizzle-atom row of a KV slot
 static constexpr uint32_t S_CHUNK_ELEMS = 16 / sizeof(KVElem);         // Elements per 16 B core-matrix row of S
@@ -179,7 +186,12 @@ static constexpr uint32_t KV_CACHE_BYTES_PER_TOKEN = OrigKVFormat::BYTES_PER_TOK
 static constexpr uint32_t RAW_KV_GROUP_BYTES = ku::ceil_div(4 * std::max({
     KVFormatCta<MODEL_TYPE, 0>::RAW_TOKEN_SMEM_STRIDE, KVFormatCta<MODEL_TYPE, CLUSTER_SIZE - 1>::RAW_TOKEN_SMEM_STRIDE,
     KVFormatCta<EXTRA_MODEL_TYPE, 0>::RAW_TOKEN_SMEM_STRIDE, KVFormatCta<EXTRA_MODEL_TYPE, CLUSTER_SIZE - 1>::RAW_TOKEN_SMEM_STRIDE}), 128u) * 128;
-static_assert(!IS_DECODE || B_TOPK / 4 * RAW_KV_GROUP_BYTES <= B_TOPK * D_QK / CLUSTER_SIZE * sizeof(bf16));   // the raw rows fit in the slot
+// A KV slot holds the block's UMMA operand (B_TOPK x D_QK KVElem). FP8_DECODE: the raw fp8 rows (B_TOPK / 4 groups of
+// RAW_KV_GROUP_BYTES) are larger than the e4m3 block, so the slot is the raw size, rounded up to the 1 KB of a swizzle atom
+static constexpr uint32_t KV_SLOT_BYTES = FP8_DECODE
+    ? ku::ceil_div(std::max<uint32_t>(B_TOPK * D_QK, B_TOPK / 4 * RAW_KV_GROUP_BYTES), 1024u) * 1024
+    : B_TOPK * D_QK / CLUSTER_SIZE * (uint32_t)sizeof(KVElem);
+static_assert(!IS_DECODE || B_TOPK / 4 * RAW_KV_GROUP_BYTES <= KV_SLOT_BYTES);   // the raw rows fit in the slot
 // CTA0 stages its scale subset in the unused tail of the KV slot. A mixed fp8/fp4 block uses
 // a common 16 B row; a pure fp8 block needs 8 B per token. All raw and scale bytes are read before
 // the dequant warpgroup's named barrier allows bf16 write-back to overwrite the slot.
@@ -260,14 +272,17 @@ static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE
 // the epilogue), and it is decode-only, so only the WIDE_WG0 form plus the QKV_FP8 opt-out is left here.
 static constexpr uint32_t EPILOGUE_TILES_AHEAD = (WIDE_WG0 && !QKV_FP8) ? std::min(6u, NUM_EPILOGUE_TILES) : 0;
 
-static constexpr uint32_t NUM_KV_SLOTS = (OVERSIZED_SMEM || QKV_FP8) ? 4 : 3;
+// FP8_DECODE: CONFIG.FP8_DECODE_KV_SLOTS slots of KV_SLOT_BYTES (34 KB); 4 fit the regular 227 KB
+static constexpr uint32_t NUM_KV_SLOTS = FP8_DECODE ? CONFIG.FP8_DECODE_KV_SLOTS : (OVERSIZED_SMEM || QKV_FP8) ? 4 : 3;
 static constexpr bool STAGE_Q = OVERSIZED_SMEM && CONFIG.STAGE_Q;
 static constexpr uint32_t NUM_INDICES_BUFS = 4;
 // Raw-gather barriers: an alternating pair, so two gather batches can be issued but not completed at the same
 // time: the front of block k+1 waits for the dequant warps to be past block k-1, the previous user of
 // bar_raw_kv_full[(k+1)%2], not past block k. With one barrier the front of block k+1 could be issued only
 // after block k's rows had arrived, so warp 11's front time added to the transport time of every block
-static constexpr uint32_t NUM_RAW_BARS = 2;
+// FP8_DECODE: CONFIG.FP8_DECODE_RAW_BARS batches (at most one per KV slot)
+static constexpr uint32_t NUM_RAW_BARS = FP8_DECODE ? CONFIG.FP8_DECODE_RAW_BARS : 2;
+static_assert(NUM_RAW_BARS >= 2 && NUM_RAW_BARS <= NUM_KV_SLOTS);
 static constexpr uint32_t NUM_P_BUFS = CLUSTER_SIZE == 2 ? 1 : 2;
 static constexpr uint32_t NEED_TP_EMPTY_BAR = NUM_P_BUFS == 1;  // Don't need to wait for P's emptiness as long as P has >= 2 buffers, since "we are issuing P[i]" <-- "O[i-2] has been issued" <-- "S[i-2] is ready" <-- "P[i-2] is free"
 
@@ -317,13 +332,13 @@ using TiledMMA_SV = cute::conditional_t<
 >;
 
 struct SharedMemoryPlan {
-    CUTE_ALIGNAS(1024) KVElem kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) KVElem kv_slots[NUM_KV_SLOTS][KV_SLOT_BYTES / sizeof(KVElem)];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
     CUTE_ALIGNAS(1024) KVElem s[H_Q_PER_CTA * B_TOPK];
     CUTE_ALIGNAS(128) bf16 q_half_buf[STAGE_Q ? H_Q * D_QK / 2 : 0];
     CUTE_ALIGNAS(1024) float p_exchange_buf[QK_SINGLE_RAIL ? 0 : 4][32*NUM_P_ELEMS_PER_THREAD];   // QK_SINGLE_RAIL: unused
-    // QK_SINGLE_RAIL: WG0's e4m3 Q halves, [16 B chunk][thread] so that both the stores and the partner's loads are
-    // conflict-free (consecutive threads, consecutive 16 B)
-    CUTE_ALIGNAS(128) uint8_t q_xchg_buf[QK_SINGLE_RAIL ? 128 * D_QK / NUM_MRGEMM_RAILS : 0];
+    // QK_SINGLE_RAIL (prefill): WG0's e4m3 Q halves, [16 B chunk][thread] so that both the stores and the partner's loads
+    // are conflict-free (consecutive threads, consecutive 16 B). FP8_DECODE reads its e4m3 Q whole, without the exchange
+    CUTE_ALIGNAS(128) uint8_t q_xchg_buf[(QK_SINGLE_RAIL && !FP8_DECODE) ? 128 * D_QK / NUM_MRGEMM_RAILS : 0];
     CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
     // Decode: WG10 produces metadata once for the four dequant warps. 16 B aligned so that the fp4 path can read
     // the coordinates of 4 consecutive rows with one LDS.128
