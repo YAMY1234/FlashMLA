@@ -17,6 +17,14 @@
 
 namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
+#ifdef H193_TRACE
+// H193 dev-only cycle trace: g_h193_trace[(cta * 16 + event) * 64 + index] = clock64 (low 32 bits)
+__device__ uint32_t *g_h193_trace = nullptr;
+#define H193_T(ev, idx) do { uint32_t _i = (idx); if (g_h193_trace != nullptr && blockIdx.x < 256 && _i < 64) g_h193_trace[(blockIdx.x * 16 + (ev)) * 64 + _i] = (uint32_t)clock64(); } while (0)
+#else
+#define H193_T(ev, idx) do {} while (0)
+#endif
+
 static constexpr float MAX_INIT_VAL = -1e30;
 enum class QSource { Global, LastKvSlot, HalfBuffer };
 static constexpr float O_QUANT_CLAMP_MIN_VALUE = 1e-4;
@@ -500,6 +508,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 
     extern __shared__ char smem_buf[];
     SharedMemoryPlan &smem = *reinterpret_cast<SharedMemoryPlan*>(smem_buf);
+    if (threadIdx.x == 0) { H193_T(12, 0); }
 
     if constexpr (IS_2CTA) {
         ku::barrier_cluster_arrive_relaxed();
@@ -912,7 +921,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         // bytes), rotates the RoPE dims in fp32 and rounds them back to e4m3 at the same scale, and stores the head in
         // dim order to TMEM. The loads are issued in 4 tiles of 8 chunks (16 KB per CTA each), each tile's addresses
         // depending on the previous tile's data, for the reason given at GROUP_Q_LOADS
+        uint32_t h193_job = 0, h193_epi = 0;
         auto load_q8_and_save_to_tmem = [&](const OuterloopArgs &cur_job) {
+            if (idx_in_warpgroup == 0) { H193_T(11, h193_job); }
             static constexpr uint32_t NUM_CHUNKS = D_QK / 16;
             static constexpr uint32_t CHUNKS_PER_TILE = 8;
             static constexpr uint32_t FIRST_ROPE_CHUNK = D_NOPE / 16;
@@ -973,6 +984,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             cutlass::arch::fence_view_async_tmem_store();
             ku::tcgen05_before_thread_sync();
             arrive_on_cta0_barrier(smem.bar_tQ_full);
+            if (idx_in_warpgroup == 0) { H193_T(8, h193_job); }
+            ++h193_job;
         };
         auto store_o = [&](const OuterloopArgs &cur_job, const bool &is_last_job) { 
             smem.bar_li_mi_full.wait(cur_job.job_idx_mod_2);
@@ -994,6 +1007,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 
             smem.bar_tO_full.wait(cur_job.job_idx_mod_2);
             ku::tcgen05_after_thread_sync();
+            if (idx_in_warpgroup == 0) { H193_T(9, h193_epi); }
             
             static constexpr uint32_t MMA_ATOM_N = 256;
             static constexpr uint32_t NUM_MMA_ATOMS = D_VO / MMA_ATOM_N;
@@ -1227,6 +1241,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             // Don't arrive on the barrier if this job is the last job, to avoid "cluster target block not present"
                             arrive_on_cta0_barrier(smem.bar_tO_empty);
                         }
+                        if (idx_in_warpgroup == 0) { H193_T(10, h193_epi); }
+                        ++h193_epi;
                     }
                     finish_tile(mma_atom_idx, epilogue_tile_idx_in_atom, output, reduce_result_by_tmem_ld);
                 }
@@ -1317,6 +1333,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 auto [p_buf_idx, p_bar_phase] = rs.get<NUM_P_BUFS>();
                 smem.bar_tP_full[p_buf_idx].wait(p_bar_phase);
                 smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
+                if (idx_in_warpgroup == 0) { H193_T(4, rs.cur_block_idx); }
                 ku::tcgen05_after_thread_sync();
 
                 float p[NUM_ELEMS_PER_THREAD];
@@ -1399,7 +1416,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 li = fmaf(li, scale_for_old, cur_sum);
 
                 // Store S
+                if (idx_in_warpgroup == 0) { H193_T(14, rs.cur_block_idx); }
                 smem.bar_SO_empty.wait(rs.get<1>().second^1);
+                if (idx_in_warpgroup == 0) { H193_T(5, rs.cur_block_idx); }
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD/(int)S_CHUNK_ELEMS; ++i) {
                     ku::st_shared(sS_base + i*S_CHUNK_ELEMS*H_Q_PER_CTA, *(__int128_t*)(s + i*S_CHUNK_ELEMS));
@@ -1415,6 +1434,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 fence_view_async_shared();
                 ku::tcgen05_before_thread_sync();
                 arrive_on_cta0_barrier(smem.bar_SO_full);
+                if (idx_in_warpgroup == 0) { H193_T(6, rs.cur_block_idx); }
                 rs.update();
             }
 
@@ -1526,6 +1546,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 while (!qk_all_done || num_sv_issued < num_qk_issued) {
                     if (num_sv_issued < num_qk_issued && smem.bar_SO_full.test_wait(rs_sv.get<1>().second)
                         && (sv_block_idx > 0 || smem.bar_tO_empty.test_wait(sv_job.job_idx_mod_2 ^ 1))) {
+                        H193_T(3, num_sv_issued);
                         issue_sv(sv_job, sv_block_idx);
                         ++num_sv_issued;
                         if (++sv_block_idx == sv_job.num_kv_blocks) {
@@ -1551,6 +1572,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             ready = smem.bar_tQ_full.test_wait(qk_job.job_idx_mod_2);
                         }
                         if (ready) {
+                            H193_T(2, num_qk_issued);
                             issue_qk(qk_job, qk_block_idx);
                             kv_slot_full_arrived = false;
                             ++num_qk_issued;
@@ -1920,6 +1942,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         uint32_t next_block_idx = kv_block_idx + 1 < cur_job.num_kv_blocks ? kv_block_idx + 1 : 0;
                         if (has_next) {
                             issue_front(next_block_job, next_block_idx);
+                            if (lane_idx == 0) { H193_T(7, issued_block_idx + 1); }
                         }
                         ++issued_block_idx;
                     }
@@ -1949,6 +1972,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
                         auto [raw_buf, raw_bar_phase] = rs_back.get<NUM_RAW_BARS>();
                         smem.bar_raw_kv_full[raw_buf].wait(raw_bar_phase);
+                        if (local_warp_idx == 0 && lane_idx == 0) { H193_T(0, rs_back.cur_block_idx); }
                         if (elect_one_sync()) {
                             smem.bar_wg1_past_raw[raw_buf].arrive();
                         }
@@ -1963,6 +1987,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         auto [indices_buf_idx, indices_bar_phase] = rs_back.get<NUM_INDICES_BUFS>();
                         auto [kv_slot_idx, kv_bar_phase] = rs_back.get<NUM_KV_SLOTS>();
                         dq_rows.run_block(num_fp8_tokens, kv_slot_idx, indices_buf_idx);
+                        if (local_warp_idx == 0 && lane_idx == 0) { H193_T(1, rs_back.cur_block_idx); }
                         rs_back.update();
                     }
                     cur_job = next_job;
