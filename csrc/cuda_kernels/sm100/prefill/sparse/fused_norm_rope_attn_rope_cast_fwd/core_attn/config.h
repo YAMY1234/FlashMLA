@@ -277,7 +277,8 @@ static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE
 // the epilogue), and it is decode-only, so only the WIDE_WG0 form plus the QKV_FP8 opt-out is left here.
 static constexpr uint32_t EPILOGUE_TILES_AHEAD = (WIDE_WG0 && !QKV_FP8) ? std::min(6u, NUM_EPILOGUE_TILES) : 0;
 
-// FP8_DECODE: CONFIG.FP8_DECODE_KV_SLOTS slots of KV_SLOT_BYTES (34 KB); 4 fit the regular 227 KB
+// FP8_DECODE: CONFIG.FP8_DECODE_KV_SLOTS slots of KV_SLOT_BYTES (34 KB); 5 fit the regular 227 KB. Past ~228 KB (7 slots,
+// in the oversized shared memory) the kernel measured 25% slower on VR200, so it does not use the oversized mode
 static constexpr uint32_t NUM_KV_SLOTS = FP8_DECODE ? CONFIG.FP8_DECODE_KV_SLOTS : (OVERSIZED_SMEM || QKV_FP8) ? 4 : 3;
 static constexpr bool STAGE_Q = OVERSIZED_SMEM && CONFIG.STAGE_Q;
 static constexpr uint32_t NUM_INDICES_BUFS = 4;
@@ -285,9 +286,7 @@ static constexpr uint32_t NUM_INDICES_BUFS = 4;
 // time: the front of block k+1 waits for the dequant warps to be past block k-1, the previous user of
 // bar_raw_kv_full[(k+1)%2], not past block k. With one barrier the front of block k+1 could be issued only
 // after block k's rows had arrived, so warp 11's front time added to the transport time of every block
-// FP8_DECODE: CONFIG.FP8_DECODE_RAW_BARS batches (at most one per KV slot)
-static constexpr uint32_t NUM_RAW_BARS = FP8_DECODE ? CONFIG.FP8_DECODE_RAW_BARS : 2;
-static_assert(NUM_RAW_BARS >= 2 && NUM_RAW_BARS <= NUM_KV_SLOTS);
+static constexpr uint32_t NUM_RAW_BARS = 2;
 static constexpr uint32_t NUM_P_BUFS = CLUSTER_SIZE == 2 ? 1 : 2;
 static constexpr uint32_t NEED_TP_EMPTY_BAR = NUM_P_BUFS == 1;  // Don't need to wait for P's emptiness as long as P has >= 2 buffers, since "we are issuing P[i]" <-- "O[i-2] has been issued" <-- "S[i-2] is ready" <-- "P[i-2] is free"
 

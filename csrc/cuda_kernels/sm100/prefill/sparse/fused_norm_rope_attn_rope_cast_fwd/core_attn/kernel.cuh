@@ -2252,7 +2252,7 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
         }
     }
     if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Decode && CONFIG.QKV_FP8) {
-        // fp8 decode: its 4 KV slots of e4m3 fit the regular shared memory, so it needs no oversized variant. Above one
+        // fp8 decode: its KV slots of e4m3 fit the regular shared memory, so it needs no oversized variant. Above one
         // wave the indices warp prefetches the next job's first block; up to one wave the O epilogue is pipelined
         constexpr Config ONE_WAVE_CONFIG = [] {
             Config config = CONFIG;

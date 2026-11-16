@@ -21,8 +21,7 @@ struct Config {
     bool JOB_PREFETCH = false;         // Decode, above one wave: prefetch the next job's block 0 indices
     bool QKV_FP8 = false;              // Prefill h64: `kv` is e4m3, and Q, K, V and P enter the UMMAs as e4m3. Decode h64 with
                                        // an fp4 extra cache: e4m3 Q with q_head_scale, KV dequantized to e4m3 (FP8_DECODE)
-    uint32_t FP8_DECODE_KV_SLOTS = 4;  // FP8_DECODE: the number of KV slots
-    uint32_t FP8_DECODE_RAW_BARS = 2;  // FP8_DECODE: raw-gather batches in flight (see NUM_RAW_BARS)
+    uint32_t FP8_DECODE_KV_SLOTS = 5;  // FP8_DECODE: the number of KV slots (5 of 34 KB fit the regular 227 KB)
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel
