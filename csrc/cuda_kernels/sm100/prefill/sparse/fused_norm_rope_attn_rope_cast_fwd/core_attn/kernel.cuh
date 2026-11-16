@@ -1506,7 +1506,10 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 rs_sv.update();
             };
 
-            if constexpr (IS_DECODE && !NEED_TP_EMPTY_BAR) {
+            // FP8_DECODE keeps the fixed interleaving below: the adaptive issue's test_wait polling takes issue slots from
+            // the dequant warp that shares its sub-partition, and in the fp8 decode the dequant warpgroup (one named
+            // barrier per block) is the stage that sets the pace
+            if constexpr (IS_DECODE && !NEED_TP_EMPTY_BAR && !FP8_DECODE) {
                 // Adaptive issue. In the fixed order SV(g) is issued after QK(g+1)'s kv_slot_full wait, so a late
                 // dequant of block g+1 delays SV(g) and the release of slot g to the KV producer. The two gemms
                 // wait on different barriers (kv_slot_full vs SO_full), so the warp polls both and issues
