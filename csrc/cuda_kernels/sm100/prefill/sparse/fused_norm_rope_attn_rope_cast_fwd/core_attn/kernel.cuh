@@ -94,6 +94,27 @@ uint32_t fp8x4_to_e4m3x4_with_scale(uint32_t in, __nv_fp8_e8m0 scale_e8m0) {
     return out;
 }
 
+// rescale_O with the stores waited for once, at the end: the chunks are disjoint TMEM columns, so a chunk's load need not
+// wait for the previous chunk's store (rescale_O waits for each). The caller's fence before its SO_full arrive follows
+// the final wait. The fp8 decode rescales more often than the bf16 kernels (RESCALE_THRESHOLD)
+template<int NUM_COLS, int CHUNK_SIZE, int TMEM_COL_START>
+__device__ __forceinline__
+void rescale_O_one_store_wait(float scale_factor) {
+    const float2 scale_factor_float2 = {scale_factor, scale_factor};
+    CUTE_UNROLL
+    for (int chunk_idx = 0; chunk_idx < NUM_COLS / CHUNK_SIZE; ++chunk_idx) {
+        float2 o[CHUNK_SIZE / 2];
+        ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(TMEM_COL_START + chunk_idx * CHUNK_SIZE, o);
+        cutlass::arch::fence_view_async_tmem_load();
+        CUTE_UNROLL
+        for (int i = 0; i < CHUNK_SIZE / 2; ++i) {
+            o[i] = ku::float2_mul(o[i], scale_factor_float2);
+        }
+        ku::tmem_st_32dp32bNx<CHUNK_SIZE>(TMEM_COL_START + chunk_idx * CHUNK_SIZE, o);
+    }
+    cutlass::arch::fence_view_async_tmem_store();
+}
+
 // To achieve prefill - decoding alignment while using block_size = 96, decoding must reproduce
 // prefill's "natural" blocking of the concatenated indices array ([topk orig slots; extra_topk
 // extra slots], tiled by B_TOPK). Since topk (e.g. 128) may not be a multiple of B_TOPK (e.g. 96),
@@ -1375,7 +1396,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     cur_pi_max = max(cur_pi_max, smem.rowwise_max_buf[max_buf_idx][idx_in_warpgroup ^ (g * H_Q_PER_CTA)]);
                 }
                 real_mi = max(real_mi, cur_pi_max);
-                bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
+                bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > RESCALE_THRESHOLD);
 
                 float new_max, scale_for_old;
                 if (!should_scale_o) {
@@ -1408,7 +1429,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 // Rescale O
                 if (kv_block_idx > 0 && should_scale_o) {
                     ku::tcgen05_after_thread_sync();
-                    rescale_O<D_VO / FOLD_FACTOR, 32, tmem_cols::O>(scale_for_old);
+                    if constexpr (FP8_DECODE) {
+                        rescale_O_one_store_wait<D_VO / FOLD_FACTOR, 32, tmem_cols::O>(scale_for_old);
+                    } else {
+                        rescale_O<D_VO / FOLD_FACTOR, 32, tmem_cols::O>(scale_for_old);
+                    }
                     ku::tcgen05_before_thread_sync();
                 }
 

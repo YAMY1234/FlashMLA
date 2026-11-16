@@ -122,16 +122,21 @@ static constexpr uint32_t OVERSIZED_SMEM_CAPACITY = 334848;
 //   of the single-rail QK (below) stores whole chunks to TMEM
 // - one 32-bit TMEM word of the A operand holds 4 Q elements, a 16 B core-matrix row of S 16 tokens
 static constexpr bool QKV_FP8 = CONFIG.QKV_FP8;
-// QKV_FP8: S is computed as exp2(p * c - m + P_LOG2_SCALE), i.e. scaled by 4 before its e4m3 cast, so that fewer of its
-// small values fall into e4m3's subnormals or to zero. S <= 2^6 relative to the running max (the rescale threshold), so
-// 4 * S <= 256 stays below 448. li sums the scaled values, so O / li is unchanged; the row's max is published as
-// m - P_LOG2_SCALE to the epilogue, which uses it only for lse and the sink term
-static constexpr float P_LOG2_SCALE = QKV_FP8 ? 2.0f : 0.0f;
+// O is rescaled when a row's max grows by more than RESCALE_THRESHOLD (log2 units), so S <= 2^RESCALE_THRESHOLD relative
+// to the running max.
+// QKV_FP8: S is computed as exp2(p * c - m + P_LOG2_SCALE), i.e. scaled by 2^P_LOG2_SCALE before its e4m3 cast, so that
+// fewer of its small values fall into e4m3's subnormals or to zero; 2^(P_LOG2_SCALE + RESCALE_THRESHOLD) <= 256 stays
+// below 448. li sums the scaled values, so O / li is unchanged; the row's max is published as m - P_LOG2_SCALE to the
+// epilogue, which uses it only for lse and the sink term. Prefill: threshold 6, S x 4. Decode: threshold 4, S x 16, more
+// precise for more rescales; the same S quantization as vLLM's fp8-Q decode (identical outputs on the same inputs)
+static constexpr bool FP8_DECODE = QKV_FP8 && FWD_MODE == SparseAttnFwdMode::Decode;   // see below
+static constexpr float RESCALE_THRESHOLD = FP8_DECODE ? 4.0f : 6.0f;
+static constexpr float P_LOG2_SCALE = QKV_FP8 ? (FP8_DECODE ? 4.0f : 2.0f) : 0.0f;
+static_assert(P_LOG2_SCALE + RESCALE_THRESHOLD <= 8.0f);
 // fp8 decode (QKV_FP8 with FWD_MODE == Decode, h_q = 64, an fp4 extra cache): the same QK / softmax / SV as the fp8
 // prefill, with two differences. Q is read as e4m3 with a per-head scale (`q_head_scale`, folded into the softmax
 // scale), so the kernel only re-rounds its RoPE dims. The decode dequant writes e4m3 instead of bf16: every gathered row
 // is rounded to e4m3 once (fp8 rows: e4m3 x ue8m0 scale; fp4 rows: e2m1 x e4m3 scale), in place in the KV slot
-static constexpr bool FP8_DECODE = QKV_FP8 && FWD_MODE == SparseAttnFwdMode::Decode;
 static_assert(!QKV_FP8 || (H_Q == 64 && !ENABLE_Q_NORM));
 static_assert(!QKV_FP8 || FP8_DECODE || (FWD_MODE == SparseAttnFwdMode::Prefill && !OVERSIZED_SMEM));
 static_assert(!FP8_DECODE || (CONFIG.EXTRA_MODEL_TYPE == ModelType::V41_FP4 && !CONFIG.STAGE_Q));
