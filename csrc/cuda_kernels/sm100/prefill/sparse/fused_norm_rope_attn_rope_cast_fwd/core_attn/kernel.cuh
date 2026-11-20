@@ -594,6 +594,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
     } else {
         __syncthreads();
     }
+    if constexpr (IS_DECODE) {
+        // Under PDL the prologue above overlaps the producer's tail; every global read comes after this wait
+        // (a no-op without the launch attribute)
+        cudaGridDependencySynchronize();
+    }
     struct OuterloopArgs {
         bool is_valid;
         uint32_t s_q_idx;
@@ -2171,9 +2176,14 @@ void Kernel<CONFIG>::run(const Params &params) {
 
     auto kernel = &fwd_kernel<Kernel>;
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    // FLASH_MLA_DECODE_PDL=1: launch decode with programmatic stream serialization (the kernel waits in devfunc)
+    static const bool decode_pdl = [] {
+        const char *v = std::getenv("FLASH_MLA_DECODE_PDL");
+        return v != nullptr && v[0] == '1';
+    }();
     if constexpr (OVERSIZED_SMEM) {
 #if CUDART_VERSION >= 13040
-        cudaLaunchAttribute attrs[2];
+        cudaLaunchAttribute attrs[3];
         attrs[0].id = cudaLaunchAttributeClusterDimension;
         attrs[0].val.clusterDim.x = CLUSTER_SIZE;
         attrs[0].val.clusterDim.y = 1;
@@ -2187,6 +2197,11 @@ void Kernel<CONFIG>::run(const Params &params) {
         launch_config.stream = params.stream;
         launch_config.attrs = attrs;
         launch_config.numAttrs = 2;
+        if (IS_DECODE && decode_pdl) {
+            attrs[2].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[2].val.programmaticStreamSerializationAllowed = 1;
+            launch_config.numAttrs = 3;
+        }
         KU_CUDA_CHECK(cudaLaunchKernelEx(&launch_config, kernel, params, tma_params, aux_params));
 #else
         KU_ASSERT(false, "Oversized shared memory requires CUDA 13.4");
@@ -2194,6 +2209,24 @@ void Kernel<CONFIG>::run(const Params &params) {
         return;
     }
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    if (IS_DECODE && decode_pdl) {
+        cudaLaunchAttribute attrs[2];
+        attrs[0].id = cudaLaunchAttributeClusterDimension;
+        attrs[0].val.clusterDim.x = CLUSTER_SIZE;
+        attrs[0].val.clusterDim.y = 1;
+        attrs[0].val.clusterDim.z = 1;
+        attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[1].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t launch_config = {};
+        launch_config.gridDim = dim3(params.s_q * CLUSTER_SIZE, 1, 1);
+        launch_config.blockDim = dim3(NUM_THREADS, 1, 1);
+        launch_config.dynamicSmemBytes = smem_size;
+        launch_config.stream = params.stream;
+        launch_config.attrs = attrs;
+        launch_config.numAttrs = 2;
+        KU_CUDA_CHECK(cudaLaunchKernelEx(&launch_config, kernel, params, tma_params, aux_params));
+        return;
+    }
 
     cutlass::ClusterLaunchParams launch_params = {
         dim3(params.s_q * CLUSTER_SIZE, 1, 1),
