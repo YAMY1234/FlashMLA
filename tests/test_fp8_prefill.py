@@ -341,3 +341,105 @@ def test_fp8_prefill_deterministic():
     for _ in range(5):
         r1 = run(q, kv8, idx, sink, sm_scale, rope=rope)
         assert all(torch.equal(a, b) for a, b in zip(r0, r1))
+
+
+# ---- e4m3 Q at a static per-head scale (q_head_scale), as wq_b writes it ----
+
+def run_q8(q8, q_head_scale, kv, idx, sink, sm_scale, topk_length=None, rope=None):
+    """q8: plain [s_q, H, D] float8_e4m3fn holding Q / q_head_scale per head; kv: the e4m3 kv. Returns the raw outputs"""
+    s_q = q8.shape[0]
+    pos, cs = identity_rope(s_q) if rope is None else rope
+    out = flash_mla.fused_norm_rope_attn_rope_cast.prefill(
+        False, RMS_NORM_EPS, pos.int().cuda(), False, D_ROPE, cs.float().cuda(), N_WV, 32, True, True, True,
+        permute_q(q8).cuda(), kv.cuda().view(kv.shape[0], 1, D), idx.cuda().view(s_q, 1, -1), sm_scale, D,
+        sink.float().cuda(),
+        torch.full((s_q,), idx.shape[1], dtype=torch.int32).cuda() if topk_length is None else topk_length.int().cuda(),
+        q_head_scale=q_head_scale.float().cuda())
+    torch.cuda.synchronize()
+    return out
+
+
+def run_raw(q, kv, idx, sink, sm_scale, topk_length=None, rope=None):
+    """run() without decoding: (out_fp8, out_sf, max_logits, lse) of the bf16-Q op"""
+    s_q = q.shape[0]
+    pos, cs = identity_rope(s_q) if rope is None else rope
+    out = flash_mla.fused_norm_rope_attn_rope_cast.prefill(
+        False, RMS_NORM_EPS, pos.int().cuda(), False, D_ROPE, cs.float().cuda(), N_WV, 32, True, True, True,
+        permute_q(q).cuda(), kv.cuda().view(kv.shape[0], 1, D), idx.cuda().view(s_q, 1, -1), sm_scale, D,
+        sink.float().cuda(),
+        torch.full((s_q,), idx.shape[1], dtype=torch.int32).cuda() if topk_length is None else topk_length.int().cuda())
+    torch.cuda.synchronize()
+    return out
+
+
+def pow2_head_scales(g, lo=-1, hi=2):
+    """per-head powers of two in [2^lo, 2^hi]"""
+    return torch.exp2(torch.randint(lo, hi + 1, (H_Q,), generator=g).float())
+
+
+@requires_sm100
+@pytest.mark.parametrize("topk", [128, 640])
+def test_fp8q_prefill_unit_scale_bitwise(topk):
+    """q_head_scale = 1 and an identity RoPE: the e4m3 Q path must give the same bytes as the bf16-Q fp8 path fed the
+    same e4m3 values as bf16 (which that path casts back to the same e4m3), including partly valid blocks and empty rows"""
+    s_q, s_kv = 1024, 8192
+    q, ws, idx, sink, tl = make_partial_case(s_q, s_kv, topk, seed=777 + topk)
+    q8 = to_e4m3(q)
+    kv8 = to_e4m3(ws)
+    a = run_q8(q8, torch.ones(H_Q), kv8, idx, sink, D ** -0.5, topk_length=tl)
+    b = run_raw(q8.to(torch.bfloat16), kv8, idx, sink, D ** -0.5, topk_length=tl)
+    for name, x, y in zip(("out_fp8", "out_sf", "max_logits", "lse"), a, b):
+        assert torch.equal(x.view(torch.uint8) if x.dtype == torch.float8_e4m3fn else x,
+                           y.view(torch.uint8) if y.dtype == torch.float8_e4m3fn else y), f"{name} differs"
+
+
+# Per-head power-of-two scales vs the bf16-Q fp8 path on Q = q8 * scale (exact in bf16 and in e4m3 for these ranges):
+# the scores differ only in where the power of two enters the fp32 product, so the outputs agree to a few e4m3 ulps
+SCALED_LIMITS = {"rel_l2": 0.01, "tok_cos": 0.9999, "lse_mean": 1e-5}
+
+
+@requires_sm100
+@pytest.mark.parametrize("topk", [128, 640])
+def test_fp8q_prefill_head_scale(topk):
+    s_q, s_kv = 1024, 8192
+    q, ws, idx, sink = make_case("bench", s_q, s_kv, topk, seed=99 + topk)
+    g = torch.Generator(device="cpu").manual_seed(5 + topk)
+    scale = pow2_head_scales(g)
+    q = q * 8   # |q| ~ 0.8: q / scale stays in e4m3's normal range for scales up to 4
+    q8 = to_e4m3(q.float() / scale[None, :, None])
+    q_eq = (q8.float() * scale[None, :, None]).to(torch.bfloat16)
+    assert torch.equal(to_e4m3(q_eq).float(), q_eq.float())   # the reference Q is exactly e4m3
+    kv8 = to_e4m3(ws)
+    o, sf, ml, lse = run_q8(q8, scale, kv8, idx, sink, D ** -0.5)
+    o_ref, sf_ref, ml_ref, lse_ref = run_raw(q_eq, kv8, idx, sink, D ** -0.5)
+    m = metrics(dequant_out(o, sf, s_q), lse.double(), dequant_out(o_ref, sf_ref, s_q), lse_ref.double())
+    assert passes(m, SCALED_LIMITS), f"e4m3 Q x scale vs bf16 Q: {m}"
+    assert (ml - ml_ref).abs().max().item() <= 1e-4 * ml_ref.abs().max().item()
+    # sensitivity: ignoring the scale must fail
+    mm = metrics(dequant_out(o, sf, s_q), lse.double(), *[x for x in run(q8.to(torch.bfloat16), kv8, idx, sink, D ** -0.5)[:2]])
+    assert not passes(mm, SCALED_LIMITS), f"insensitive to q_head_scale: {mm}"
+
+
+@requires_sm100
+@pytest.mark.parametrize("topk", [128, 640])
+def test_fp8q_prefill_rope(topk):
+    """Random RoPE, per-head scales: vs the bf16 op on the unscaled Q (ROPE_LIMITS). The RoPE dims are rotated in fp32
+    from e4m3 and rounded once, so wrong tiles or a missing inverse RoPE fail as in test_fp8_prefill_rope"""
+    s_q, s_kv = 1024, 8192
+    q, ws, idx, sink, rope, sm_scale = make_rope_case(s_q, s_kv, topk, seed=4321 + topk)
+    g = torch.Generator(device="cpu").manual_seed(11 + topk)
+    scale = pow2_head_scales(g, -2, 1)
+    q8 = to_e4m3(q.float() / scale[None, :, None])
+    ro, rl, _ = run(q, ws, idx, sink, sm_scale, rope=rope)
+    o, sf, _, lse = run_q8(q8, scale, to_e4m3(ws), idx, sink, sm_scale, rope=rope)
+    m = metrics(dequant_out(o, sf, s_q), lse.double(), ro, rl)
+    assert passes(m, ROPE_LIMITS), f"fp8 Q vs bf16: {m}"
+    mm = metrics(dequant_out(o, sf, s_q), lse.double(), rope_tile(ro, rope, D // D_ROPE - 1), rl)
+    assert not passes(mm, ROPE_LIMITS), f"insensitive to O's inverse RoPE: {mm}"
+
+
+@requires_sm100
+def test_fp8q_prefill_rejects_bf16_kv():
+    q, ws, idx, sink = make_case("bench", 128, 1024, 128, seed=6)
+    with pytest.raises(RuntimeError, match="fp8 kv"):
+        run_q8(to_e4m3(q), torch.ones(H_Q), ws, idx, sink, D ** -0.5)

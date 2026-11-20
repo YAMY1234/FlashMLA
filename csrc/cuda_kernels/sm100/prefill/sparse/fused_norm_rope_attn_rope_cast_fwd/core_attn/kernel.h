@@ -22,6 +22,7 @@ struct Config {
     bool QKV_FP8 = false;              // Prefill h64: `kv` is e4m3, and Q, K, V and P enter the UMMAs as e4m3. Decode h64 with
                                        // an fp4 extra cache: e4m3 Q with q_head_scale, KV dequantized to e4m3 (FP8_DECODE)
     uint32_t FP8_DECODE_KV_SLOTS = 5;  // FP8_DECODE: the number of KV slots (5 of 34 KB fit the regular 227 KB)
+    bool Q_FP8 = false;                // Prefill with QKV_FP8: `q` is e4m3 holding Q / q_head_scale (as FP8_DECODE's Q)
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel
@@ -52,7 +53,8 @@ struct ParamsTemplate : Base {
     // out_sf in the 128x4-swizzled scale layout per wv group: row r at word (r/128)*128*words_per_row + (r%32)*4 + (r/32)%4, 4-column stride 128
     bool out_sf_swizzled_128x4 = false;
 
-    // FP8_DECODE: `q` holds e4m3 (stride_q_s_q counts e4m3 elements) and head h's values are Q / q_head_scale[h]
+    // Q_E4M3 (FP8_DECODE, or the fp8 prefill with Q_FP8): `q` holds e4m3 (stride_q_s_q counts e4m3 elements) and head
+    // h's values are Q / q_head_scale[h]
     float* __restrict__ q_head_scale = nullptr;  // [h_q]
 };
 

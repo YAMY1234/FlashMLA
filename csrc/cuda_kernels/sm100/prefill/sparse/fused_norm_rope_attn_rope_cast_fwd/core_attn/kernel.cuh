@@ -927,7 +927,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 smem.bar_q_sqr_sum_full.arrive();
             }
         };
-        // FP8_DECODE: Q arrives as e4m3 (Q / q_head_scale, in the permuted layout: 16-element chunks interleaved across
+        // Q_E4M3: Q arrives as e4m3 (Q / q_head_scale, in the permuted layout: 16-element chunks interleaved across
         // heads, chunk c of head h at byte (c * H_Q + h) * 16). Single-rail QK wants the whole head in both lane groups
         // (config.h), so each thread loads all 512 B of its head (the thread of the other lane group loads the same
         // bytes), rotates the RoPE dims in fp32 and rounds them back to e4m3 at the same scale, and stores the head in
@@ -945,6 +945,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             uint32_t q_words[NUM_CHUNKS * 4];
             uint32_t q_load_dep = 0;
             const uint32_t q_zero = cur_job.topk_length >> 31;   // 0 at run time, see load_q_and_save_to_tmem
+            // The fp8 prefill issues all 32 loads at once: its jobs are short, and serial tiles put ~3 load latencies
+            // between jobs (the reason it does not group its bf16 Q loads either, GROUP_Q_LOADS)
+            static constexpr bool GROUP_Q8_LOADS = FP8_DECODE;
             CUTE_UNROLL
             for (uint32_t tile = 0; tile < NUM_CHUNKS / CHUNKS_PER_TILE; ++tile) {
                 CUTE_UNROLL
@@ -961,7 +964,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 for (uint32_t i = 0; i < CHUNKS_PER_TILE; ++i) {
                     tile_words ^= q_words[(tile * CHUNKS_PER_TILE + i) * 4];
                 }
-                q_load_dep = tile_words & q_zero;
+                if constexpr (GROUP_Q8_LOADS) {
+                    q_load_dep = tile_words & q_zero;
+                }
             }
             // RoPE: dims D_NOPE + 2j, D_NOPE + 2j + 1 are pair j, whose cos / sin lane j holds
             CUTE_UNROLL
@@ -1260,7 +1265,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             CUTE_NO_UNROLL
             for (bool first = true; ; first = false) {
                 if (q_job.is_valid) {
-                    if constexpr (FP8_DECODE) {
+                    if constexpr (Q_E4M3) {
                         load_q8_and_save_to_tmem(q_job);
                     } else {
                         load_q_and_save_to_tmem.template operator()<QSource::Global>(q_job);
@@ -1306,8 +1311,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         static_assert(FOLD_FACTOR == 2);
         const uint32_t token_slice = local_warp_idx >= 2 ? 1u : 0u;
         KVElem *sS_base = smem.s + token_slice * (H_Q_PER_CTA * (B_TOPK / FOLD_FACTOR)) + (idx_in_warpgroup % H_Q_PER_CTA) * S_CHUNK_ELEMS;
-        // FP8_DECODE: the head's Q scale folds into the softmax scale
-        const float q_head_scale = FP8_DECODE ? __ldg(params.q_head_scale + cta_idx * H_Q_PER_CTA + idx_in_warpgroup % H_Q_PER_CTA) : 1.0f;
+        // Q_E4M3: the head's Q scale folds into the softmax scale
+        const float q_head_scale = Q_E4M3 ? __ldg(params.q_head_scale + cta_idx * H_Q_PER_CTA + idx_in_warpgroup % H_Q_PER_CTA) : 1.0f;
         RingBufferState rs;
         do {
             // For definition and consistency about `mi`, `li`, and `real_mi`, plz refer to head64 prefill
@@ -1326,7 +1331,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 score_multiplier = smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup] + smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^64];
                 score_multiplier = params.sm_scale_div_log2 * rsqrtf(score_multiplier / D_QK + params.rms_norm_eps);    // rsqrt is translated to `MUFU.RSQ`
             } else {
-                score_multiplier = FP8_DECODE ? params.sm_scale_div_log2 * q_head_scale : params.sm_scale_div_log2;
+                score_multiplier = Q_E4M3 ? params.sm_scale_div_log2 * q_head_scale : params.sm_scale_div_log2;
             }
 
             smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2 ^ 1);
@@ -2139,6 +2144,7 @@ void Kernel<CONFIG>::run(const Params &params) {
             }
         }
     } else {
+        KU_ASSERT(Q_E4M3 == (params.q_head_scale != nullptr), "e4m3 Q and q_head_scale go together (the fp8 prefill with Q_FP8)");
         // The box is one 128 B swizzle-atom row; e4m3 is moved as UINT8
         tma_params.tensor_map_kv = ku::make_tensor_map(
             {(uint64_t)D_QK, (uint64_t)params.s_kv},

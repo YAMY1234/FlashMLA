@@ -140,6 +140,11 @@ static_assert(P_LOG2_SCALE + RESCALE_THRESHOLD <= 8.0f);
 static_assert(!QKV_FP8 || (H_Q == 64 && !ENABLE_Q_NORM));
 static_assert(!QKV_FP8 || FP8_DECODE || (FWD_MODE == SparseAttnFwdMode::Prefill && !OVERSIZED_SMEM));
 static_assert(!FP8_DECODE || (CONFIG.EXTRA_MODEL_TYPE == ModelType::V41_FP4 && !CONFIG.STAGE_Q));
+// Q_E4M3: Q is read as e4m3 at a static per-head scale (`q_head_scale`, folded into the softmax scale), and only its RoPE
+// dims are re-rounded (load_q8_and_save_to_tmem). FP8_DECODE always; the fp8 prefill with CONFIG.Q_FP8, where wq_b writes
+// the e4m3 Q directly (half the Q bytes, no bf16 -> e4m3 cast and no rail exchange in WG0)
+static_assert(!CONFIG.Q_FP8 || (QKV_FP8 && FWD_MODE == SparseAttnFwdMode::Prefill));
+static constexpr bool Q_E4M3 = FP8_DECODE || CONFIG.Q_FP8;
 using KVElem = std::conditional_t<QKV_FP8, fp8_e4m3, bf16>;   // The element of the KV slots and of S (UMMA operands)
 static constexpr uint32_t KV_CHUNK_ELEMS = 128 / sizeof(KVElem);       // Elements per 128 B swizzle-atom row of a KV slot
 static constexpr uint32_t S_CHUNK_ELEMS = 16 / sizeof(KVElem);         // Elements per 16 B core-matrix row of S
@@ -341,8 +346,8 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(128) bf16 q_half_buf[STAGE_Q ? H_Q * D_QK / 2 : 0];
     CUTE_ALIGNAS(1024) float p_exchange_buf[QK_SINGLE_RAIL ? 0 : 4][32*NUM_P_ELEMS_PER_THREAD];   // QK_SINGLE_RAIL: unused
     // QK_SINGLE_RAIL (prefill): WG0's e4m3 Q halves, [16 B chunk][thread] so that both the stores and the partner's loads
-    // are conflict-free (consecutive threads, consecutive 16 B). FP8_DECODE reads its e4m3 Q whole, without the exchange
-    CUTE_ALIGNAS(128) uint8_t q_xchg_buf[(QK_SINGLE_RAIL && !FP8_DECODE) ? 128 * D_QK / NUM_MRGEMM_RAILS : 0];
+    // are conflict-free (consecutive threads, consecutive 16 B). Q_E4M3 reads its e4m3 Q whole, without the exchange
+    CUTE_ALIGNAS(128) uint8_t q_xchg_buf[(QK_SINGLE_RAIL && !Q_E4M3) ? 128 * D_QK / NUM_MRGEMM_RAILS : 0];
     CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
     // Decode: WG10 produces metadata once for the four dequant warps. 16 B aligned so that the fp4 path can read
     // the coordinates of 4 consecutive rows with one LDS.128

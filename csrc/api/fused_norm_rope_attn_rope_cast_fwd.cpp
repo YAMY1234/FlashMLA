@@ -50,7 +50,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
     bool use_packed_ue8m0,
-    bool out_sf_swizzled_128x4
+    bool out_sf_swizzled_128x4,
+    const std::optional<Tensor> &q_head_scale  // [h_q], float32: q is e4m3 holding Q / q_head_scale (fp8 kv only)
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
@@ -58,6 +59,10 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     STD_TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
     // A float8_e4m3fn kv selects the fp8 sparse prefill (h_q == 64 only), read with unit scale
     const bool kv_is_fp8 = kv.scalar_type() == ScalarType::Float8_e4m3fn;
+    // An e4m3 q (with q_head_scale) selects its static-scale Q variant
+    const bool fp8_q = q.scalar_type() == ScalarType::Float8_e4m3fn;
+    STD_TORCH_CHECK(fp8_q == q_head_scale.has_value(), "q_head_scale must be given exactly when q is float8_e4m3fn");
+    STD_TORCH_CHECK(!fp8_q || kv_is_fp8, "An e4m3 q needs the fp8 kv (float8_e4m3fn)");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -95,7 +100,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_DEVICE(token_positions);
     KU_CHECK_DEVICE(cos_sin_cache);
     
-    KU_CHECK_DTYPE(q, ScalarType::BFloat16);
+    if (!fp8_q) {
+        KU_CHECK_DTYPE(q, ScalarType::BFloat16);
+    }
     STD_TORCH_CHECK(kv.scalar_type() == ScalarType::BFloat16 || kv_is_fp8, "kv must have dtype bfloat16 or float8_e4m3fn");
     STD_TORCH_CHECK(!kv_is_fp8 || h_q == 64, "The fp8 kv (float8_e4m3fn) path supports h_q == 64 only, got ", h_q);
     STD_TORCH_CHECK(!kv_is_fp8 || !enable_q_norm, "The fp8 kv (float8_e4m3fn) path supports enable_q_norm == false only");
@@ -122,6 +129,12 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_CONTIGUOUS(topk_length);
     KU_CHECK_CONTIGUOUS(token_positions);
     KU_CHECK_CONTIGUOUS(cos_sin_cache);
+    if (fp8_q) {
+        KU_CHECK_DEVICE(q_head_scale);
+        KU_CHECK_DTYPE(q_head_scale, ScalarType::Float);
+        KU_CHECK_SHAPE(q_head_scale, h_q);
+        KU_CHECK_CONTIGUOUS(q_head_scale);
+    }
 
     STD_TORCH_CHECK(num_per_channels == 32, "num_per_channels must be 32, got ", num_per_channels);
 
@@ -185,6 +198,15 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         out_sf_swizzled_128x4
     };
 
+    if (fp8_q) {
+        // params.q and params.kv (declared bf16*) point to e4m3 data, and their strides count e4m3 elements
+        params.q_head_scale = (float*)q_head_scale->data_ptr();
+        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{
+            .FWD_MODE = SparseAttnFwdMode::Prefill, .MODEL_TYPE = ModelType::V41, .EXTRA_MODEL_TYPE = ModelType::V41,
+            .H_Q = 64, .ENABLE_Q_NORM = false, .QKV_FP8 = true, .Q_FP8 = true
+        }>(params);
+        return {out_fp8, out_sf, max_logits, lse};
+    }
     if (kv_is_fp8) {
         // params.kv (declared bf16*) points to the e4m3 data here, and stride_kv_s_kv counts e4m3 elements
         sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{

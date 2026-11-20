@@ -34,6 +34,7 @@ def prefill(
     topk_length: Optional[torch.Tensor] = None,
     use_legacy: bool = False,
     out_sf_swizzled_128x4: bool = False,
+    q_head_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4.1
@@ -84,6 +85,10 @@ def prefill(
             column-block-major within each 128-row block. This is the layout block-scaled tcgen05 MMAs read scale factors
             in, and the one `flashinfer.mxfp8_quantize(..., is_sf_swizzled_layout=True)` produces, so such GEMMs can read
             it directly. Needs s_q % 128 == 0. The bytes are the same as in the default layout; only their positions change.
+        q_head_scale: optional, [h_q], float32. Given exactly when q is float8_e4m3fn, which needs the fp8 kv: q holds
+            Q / q_head_scale per head (e.g. power-of-two scales folded into the q_b_proj weight scales, so q_b_proj
+            writes the e4m3 Q directly). The kernel folds the scale into the softmax scale and rotates the RoPE dims of
+            Q in fp32, rounding them back to e4m3 at the head's scale; Q is not cast again. Otherwise as the fp8 kv path
 
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
@@ -97,12 +102,15 @@ def prefill(
     ops = get_ops(use_legacy)
     if out_sf_swizzled_128x4 and use_legacy:
         raise ValueError("out_sf_swizzled_128x4 is not supported by the legacy kernels")
+    if q_head_scale is not None and use_legacy:
+        raise ValueError("q_head_scale (an e4m3 q) is not supported by the legacy kernels")
+    extra = (out_sf_swizzled_128x4, q_head_scale) if q_head_scale is not None else ((True,) if out_sf_swizzled_128x4 else ())
     results = ops.fused_norm_rope_attn_rope_cast_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
 
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
 
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0, *((True,) if out_sf_swizzled_128x4 else ())
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0, *extra
     )
     out_fp8, out_sf, max_logits, lse = results
     return out_fp8, out_sf, max_logits, lse
