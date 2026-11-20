@@ -404,8 +404,9 @@ def test_fp8q_prefill_head_scale(topk):
     s_q, s_kv = 1024, 8192
     q, ws, idx, sink = make_case("bench", s_q, s_kv, topk, seed=99 + topk)
     g = torch.Generator(device="cpu").manual_seed(5 + topk)
-    scale = pow2_head_scales(g)
-    q = q * 8   # |q| ~ 0.8: q / scale stays in e4m3's normal range for scales up to 4
+    # scales >= 1: q8 * scale is then exact in e4m3 too (a subnormal q8 scaled down by 2 could be rounded)
+    scale = pow2_head_scales(g, 0, 2)
+    q = q * 8   # |q| ~ 0.8, below 448 after scaling
     q8 = to_e4m3(q.float() / scale[None, :, None])
     q_eq = (q8.float() * scale[None, :, None]).to(torch.bfloat16)
     assert torch.equal(to_e4m3(q_eq).float(), q_eq.float())   # the reference Q is exactly e4m3
