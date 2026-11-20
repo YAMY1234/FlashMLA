@@ -2081,6 +2081,11 @@ fwd_kernel(__grid_constant__ const typename Kernel::Params params, __grid_consta
         return;
     }
 #endif
+    if constexpr (Kernel::IS_DECODE) {
+        // Decode: let the PDL successor (wo_a GEMM) launch and run its prologue on the SMs the last wave leaves idle;
+        // it reads this kernel's output only after its griddepcontrol.wait
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
     Kernel::devfunc(params, tma_params, aux_params);
 }
 
